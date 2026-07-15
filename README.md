@@ -3,6 +3,11 @@
 **Detecting and correcting wrong facility coordinates by combining object
 detection on aerial imagery with a geospatial machine-learning pipeline.**
 
+![A U.S. wastewater treatment plant in NAIP aerial imagery](docs/example_treatment_plant_naip.png)
+
+*A wastewater treatment plant in NAIP aerial imagery — the circular clarifiers,
+digesters, and ponds are exactly the infrastructure the model learns to find.*
+
 Roughly **40% of the reported coordinates for U.S. wastewater treatment plants
 are wrong** — they point to a city hall, a mailing address, or an empty field
 instead of the plant. Wrong coordinates break every downstream use of the data:
