@@ -1,0 +1,12 @@
+# Object-detection module dependencies (pinned).
+# torch/torchvision: install a build matching your CUDA/hardware. The versions
+# below are CPU/GPU-agnostic; for recent NVIDIA GPUs you may need a newer or
+# nightly build (e.g. the cu12x wheels from https://download.pytorch.org/whl).
+ultralytics==8.3.0
+torch==2.4.1
+torchvision==0.19.1
+numpy==2.1.1
+opencv-python-headless==4.10.0.84
+pillow==10.4.0
+pyyaml==6.0.2
+pandas==2.2.3

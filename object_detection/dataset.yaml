@@ -1,0 +1,9 @@
+# Ultralytics dataset config. `path` is written by prepare_dataset.py to an
+# absolute path at build time; the relative default below works when the
+# `dataset/` directory sits alongside this file.
+path: ./dataset
+train: images/train
+val:   images/val
+
+nc: 6
+names: ['aeration_basin', 'chlorine_contact', 'clarifier', 'digester', 'drying_bed', 'oxidation_pond']

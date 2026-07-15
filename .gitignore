@@ -1,0 +1,49 @@
+# ---- Bulk data & licensed sources (never commit) ----
+# Regrid parcel data is licensed/commercial — methodology only, no extracts.
+*.parquet
+**/Parquet_Storage/
+**/Regrid/
+# NAIP tile corpora and derived rasters (large; regenerate from source services)
+**/tiles/
+**/dataset/
+**/ls_export/
+*.tif
+*.tiff
+# Keep a few curated sample tiles committed under object_detection/sample_tiles/
+!object_detection/sample_tiles/**
+
+# ---- Model training runs (keep only curated weights + results) ----
+**/runs/*/
+!object_detection/weights/
+!object_detection/results/
+
+# ---- Python ----
+__pycache__/
+*.pyc
+*.pyo
+yolo_env/
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# ---- R ----
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+**/renv/library/
+**/renv/staging/
+
+# ---- Local config / secrets ----
+.Renviron
+.env
+*.local
+
+# ---- OS / editor ----
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

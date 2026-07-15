@@ -1,0 +1,1023 @@
+---
+title: "CWNS Wastewater Treatment Plant Location Correction"
+subtitle: "Two-Stage ML Pipeline — Results Review"
+author: "Andrew Murray"
+date: today
+
+# ── Version parameter ──────────────────────────────────────────────────────────
+# By default (version: null) the report auto-detects the highest-numbered
+# Version_X folder under Location_Correction/results/.
+# Override with an explicit string to re-run an older version, e.g.:
+#   quarto render cwns_location_correction_report.qmd -P version:Version_1
+params:
+  version: null   # null = auto-detect highest Version_X; "Version_N" to override
+
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    toc-title: "Contents"
+    number-sections: true
+    code-fold: true
+    code-tools: true
+    fig-width: 9
+    fig-height: 5.5
+    fig-dpi: 150
+    embed-resources: true
+    df-print: paged
+    css: styles.css
+execute:
+  echo: true
+  warning: false
+  message: false
+  cache: true
+---
+
+```{r setup}
+#| cache: false
+library(tidyverse)
+library(arrow)
+library(here)
+library(sf)
+library(gt)
+library(gtExtras)
+library(scales)
+library(patchwork)
+library(ggridges)
+library(glue)
+
+# ── Version resolution ─────────────────────────────────────────────────────────
+# If params$version is NULL, auto-detect the highest-numbered Version_X folder.
+# Override by rendering with: quarto render ... -P version:Version_1
+.versions_root <- here("Location_Correction", "results")
+
+if (is.null(params$version)) {
+  .all_dirs  <- list.dirs(.versions_root, recursive = FALSE, full.names = FALSE)
+  .ver_dirs  <- .all_dirs[grepl("^Version_[0-9]+$", .all_dirs)]
+  if (length(.ver_dirs) == 0) {
+    stop("No Version_N folders found under: ", .versions_root)
+  }
+  .ver_nums     <- as.integer(sub("Version_", "", .ver_dirs))
+  version_label <- .ver_dirs[which.max(.ver_nums)]
+} else {
+  version_label <- params$version
+}
+
+message("Using model version: ", version_label)
+
+
+# ── Paths ──────────────────────────────────────────────────────────────────────
+results_dir <- file.path(.versions_root, version_label)
+
+path_stage1  <- file.path(results_dir, "stage1_results.parquet")
+path_stage2  <- file.path(results_dir, "stage2_results.parquet")
+path_summary <- file.path(results_dir, "plant_summary.csv")
+path_gpkg    <- file.path(results_dir, "inference_results.gpkg")
+
+# ── Thresholds (from training) ─────────────────────────────────────────────────
+STAGE1_THRESHOLD <- 0.677
+STAGE2_THRESHOLD <- 0.057
+
+# ── Theme ──────────────────────────────────────────────────────────────────────
+epa_blue   <- "#005ea2"
+epa_green  <- "#2e8540"
+epa_red    <- "#d83933"
+epa_gold   <- "#f5a623"
+epa_grey   <- "#71767a"
+epa_light  <- "#f0f4f9"
+
+theme_cwns <- function(base_size = 12) {
+  theme_minimal(base_size = base_size) +
+    theme(
+      plot.title        = element_text(face = "bold", colour = epa_blue, size = base_size + 2),
+      plot.subtitle     = element_text(colour = epa_grey, size = base_size - 1),
+      plot.caption      = element_text(colour = epa_grey, size = base_size - 3, hjust = 0),
+      axis.title        = element_text(colour = epa_grey, size = base_size - 1),
+      strip.text        = element_text(face = "bold", colour = epa_blue),
+      panel.grid.minor  = element_blank(),
+      panel.grid.major  = element_line(colour = "#e5e8ec"),
+      plot.background   = element_rect(fill = "white", colour = NA),
+      panel.background  = element_rect(fill = "white", colour = NA),
+      legend.position   = "bottom"
+    )
+}
+
+theme_set(theme_cwns())
+
+# ── Tier colour/label lookup ───────────────────────────────────────────────────
+# tier_label is already present in the summary CSV.
+# Define ordered factor levels and a matching colour palette for consistency.
+tier_levels <- c(
+  "T1 — Nearby correction (<5 km)",
+  "T1 — Distant correction (>=5 km)",
+  "T1 — No candidate found",
+  "T2 — No parcel, corrected",
+  "T2 — No parcel, uncorrected",
+  "T3 — Likely correct"
+)
+
+tier_colors <- c(
+  "T1 — Nearby correction (<5 km)"   = epa_red,
+  "T1 — Distant correction (>=5 km)" = "#a83228",
+  "T1 — No candidate found"          = "#e07b7b",
+  "T2 — No parcel, corrected"        = epa_gold,
+  "T2 — No parcel, uncorrected"      = "#c8860a",
+  "T3 — Likely correct"              = epa_green
+)
+
+# Raw tier values as they appear in the 'tier' column
+tier_raw_corrected <- c(
+  "Tier1_nearby_correction",
+  "Tier1_distant_correction",
+  "Tier2_no_parcel_corrected"
+)
+```
+
+```{r load-data}
+#| cache: true
+
+# ── Load datasets ──────────────────────────────────────────────────────────────
+# Stage 1 columns:
+#   stage1_prob_correct, stage1_prob_incorrect, CWNS_ID, no_parcel_found,
+#   trigger_reason
+#
+# Stage 2 columns:
+#   stage2_prob_correct, stage2_prob_incorrect, CWNS_ID, ll_uuid, h3_index_9,
+#   state, distance_m, within_1km, within_5km
+#
+# Summary columns (all of the above, plus):
+#   top_stage2_prob, top_ll_uuid, top_distance_m, within_1km, within_5km,
+#   FACILITY_NAME, LATITUDE, LONGITUDE, STATE_CODE, pop_served, requires_npdes,
+#   surface_water_discharge, subdivision, place, county, is_rural, tier
+
+stage1     <- read_parquet(path_stage1)
+stage2     <- read_parquet(path_stage2)
+summary_df <- read_csv(path_summary, show_col_types = FALSE)
+
+# ── Derive tier_label from tier ───────────────────────────────────────────────
+tier_map <- c(
+  "Tier1_nearby_correction"     = "T1 — Nearby correction (<5 km)",
+  "Tier1_distant_correction"    = "T1 — Distant correction (>=5 km)",
+  "Tier1_no_candidate"          = "T1 — No candidate found",
+  "Tier2_no_parcel_corrected"   = "T2 — No parcel, corrected",
+  "Tier2_no_parcel_uncorrected" = "T2 — No parcel, uncorrected",
+  "Tier3_likely_correct"        = "T3 — Likely correct"
+)
+
+summary_df <- summary_df |>
+  mutate(tier_label = factor(recode(tier, !!!tier_map), levels = tier_levels))
+
+# ── Derived counts ─────────────────────────────────────────────────────────────
+n_total   <- nrow(stage1)
+n_flagged <- sum(stage1$stage1_prob_correct < STAGE1_THRESHOLD | stage1$no_parcel_found)
+n_correct <- n_total - n_flagged
+n_stage2  <- n_distinct(stage2$CWNS_ID)
+n_cands   <- nrow(stage2)
+
+n_corrected_total <- summary_df |>
+  filter(!is.na(top_stage2_prob), top_stage2_prob >= STAGE2_THRESHOLD) |>
+  nrow()
+```
+
+---
+
+# Executive Summary {.unnumbered}
+
+::: {.callout-note appearance="minimal"}
+**Model version:** `r version_label` &emsp; | &emsp; **Results directory:** `r results_dir`
+:::
+
+This report reviews results from a two-stage machine learning pipeline designed
+to detect and correct erroneous reported locations for U.S. wastewater treatment
+plants in the **Clean Watersheds Needs Survey (CWNS)** dataset. The pipeline was
+trained and run on EPA's HPC cluster (RedHat 8.10, SLURM) using R 4.4.2.
+
+```{r exec-summary-table}
+#| echo: false
+tibble(
+  Metric = c(
+    "Plants evaluated (Stage 1)",
+    "Plants flagged for Stage 2",
+    "Candidate parcels evaluated (Stage 2)",
+    "Plants with accepted correction",
+    "Stage 1 ROC AUC",
+    "Stage 2 ROC AUC",
+    "Stage 1 decision threshold (prob_correct)",
+    "Stage 2 decision threshold (prob_correct)"
+  ),
+  Value = c(
+    comma(n_total),
+    glue("{comma(n_flagged)} ({percent(n_flagged / n_total, 0.1)})"),
+    comma(n_cands),
+    glue("{comma(n_corrected_total)} ({percent(n_corrected_total / n_total, 0.1)})"),
+    "0.986",
+    "0.975",
+    "0.677",
+    "0.057"
+  )
+) |>
+  gt() |>
+  tab_header(title = "Pipeline Performance Overview") |>
+  cols_label(Metric = "Metric", Value = "Value") |>
+  tab_style(
+    style = cell_text(weight = "bold", color = epa_blue),
+    locations = cells_column_labels()
+  ) |>
+  tab_style(
+    style = cell_fill(color = epa_light),
+    locations = cells_body(rows = seq(1, 8, 2))
+  ) |>
+  opt_table_font(font = google_font("IBM Plex Sans")) |>
+  tab_options(table.width = pct(75))
+```
+
+---
+
+# Stage 1 — Location Confidence Scoring
+
+## Score Distribution
+
+Stage 1 assigns each plant a `stage1_prob_correct` — the probability that its
+reported location falls on the correct land parcel. The decision threshold of
+**0.677** was selected at training to maximise the F-measure on held-out
+validation data. Plants are also flagged if `no_parcel_found = TRUE` regardless
+of score.
+
+```{r stage1-hist}
+#| fig-cap: "Distribution of `stage1_prob_correct` for all CWNS plants. The red
+#|   dashed line marks the classification threshold (0.677). Plants left of this
+#|   line, or with no parcel found, are sent to Stage 2."
+
+stage1 |>
+  mutate(decision = if_else(
+    stage1_prob_correct >= STAGE1_THRESHOLD & !no_parcel_found,
+    "Likely correct", "Flagged"
+  )) |>
+  ggplot(aes(x = stage1_prob_correct, fill = decision)) +
+  geom_histogram(bins = 80, colour = "white", linewidth = 0.15) +
+  geom_vline(xintercept = STAGE1_THRESHOLD, colour = epa_red,
+             linetype = "dashed", linewidth = 0.9) +
+  annotate("text", x = STAGE1_THRESHOLD + 0.015, y = Inf,
+           label = glue("Threshold\n{STAGE1_THRESHOLD}"),
+           vjust = 1.3, hjust = 0, size = 3.2, colour = epa_red) +
+  scale_fill_manual(values = c("Flagged" = epa_red, "Likely correct" = epa_green)) +
+  scale_x_continuous(labels = percent_format(1), breaks = seq(0, 1, 0.1)) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title   = "Stage 1 Score Distribution",
+    subtitle = glue("{comma(n_correct)} plants above threshold · {comma(n_flagged)} flagged"),
+    x       = "stage1_prob_correct",
+    y       = "Number of plants",
+    fill    = NULL,
+    caption = "Note: plants with no_parcel_found = TRUE are flagged regardless of score."
+  )
+```
+
+## Score by Parcel Found Status
+
+```{r stage1-parcel}
+#| fig-cap: "Stage 1 score distributions split by `no_parcel_found`. Non-intersecting
+#|   plants are sent to Stage 2 regardless of score."
+
+stage1 |>
+  mutate(parcel_status = if_else(no_parcel_found, "No parcel found", "Parcel found")) |>
+  ggplot(aes(x = stage1_prob_correct, y = parcel_status, fill = parcel_status)) +
+  geom_density_ridges(alpha = 0.75, quantile_lines = TRUE,
+                      quantiles = 0.5, colour = "white") +
+  geom_vline(xintercept = STAGE1_THRESHOLD, colour = epa_red,
+             linetype = "dashed", linewidth = 0.8) +
+  scale_fill_manual(values = c("Parcel found" = epa_blue, "No parcel found" = epa_grey),
+                    guide = "none") +
+  scale_x_continuous(labels = percent_format(1), limits = c(0, 1)) +
+  labs(
+    title = "Stage 1 Scores by Parcel Found Status",
+    x     = "stage1_prob_correct",
+    y     = NULL
+  )
+```
+
+```{r stage1-parcel-table}
+stage1 |>
+  mutate(
+    parcel_status = if_else(no_parcel_found, "No parcel found", "Parcel found"),
+    flagged       = stage1_prob_correct < STAGE1_THRESHOLD | no_parcel_found
+  ) |>
+  group_by(parcel_status) |>
+  summarise(
+    n            = n(),
+    n_flagged    = sum(flagged),
+    pct_flagged  = mean(flagged),
+    median_score = median(stage1_prob_correct),
+    mean_score   = mean(stage1_prob_correct),
+    .groups = "drop"
+  ) |>
+  gt() |>
+  tab_header(title = "Stage 1 Results by Parcel Found Status") |>
+  fmt_percent(columns = pct_flagged, decimals = 1) |>
+  fmt_number(columns = c(median_score, mean_score), decimals = 3) |>
+  fmt_integer(columns = c(n, n_flagged)) |>
+  cols_label(
+    parcel_status = "Parcel Status",
+    n             = "N Plants",
+    n_flagged     = "N Flagged",
+    pct_flagged   = "% Flagged",
+    median_score  = "Median Score",
+    mean_score    = "Mean Score"
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold", color = epa_blue),
+    locations = cells_column_labels()
+  ) |>
+  opt_table_font(font = google_font("IBM Plex Sans"))
+```
+
+## Trigger Reason Breakdown
+
+The `trigger_reason` field records which Stage 1 condition sent a plant to Stage 2.
+
+```{r trigger-reason}
+#| fig-cap: "Breakdown of `trigger_reason` for all Stage 1-flagged plants."
+
+stage1 |>
+  filter(!is.na(trigger_reason)) |>
+  count(trigger_reason, sort = TRUE) |>
+  mutate(trigger_reason = fct_reorder(trigger_reason, n)) |>
+  ggplot(aes(x = n, y = trigger_reason)) +
+  geom_col(fill = epa_blue, width = 0.65) +
+  geom_text(aes(label = comma(n)), hjust = -0.15, size = 3.2, colour = epa_grey) +
+  scale_x_continuous(labels = comma, expand = expansion(mult = c(0, 0.12))) +
+  labs(
+    title = "Stage 1 Trigger Reasons",
+    x     = "Number of plants",
+    y     = NULL
+  )
+```
+
+---
+
+# Tier Breakdown
+
+Plants are assigned to one of six tiers based on Stage 1 confidence and Stage 2
+candidate quality. `tier_label` is derived from the `tier` column using the
+mapping defined in the setup chunk.
+
+```{r tier-bar}
+#| fig-cap: "Count of CWNS plants assigned to each correction tier."
+
+summary_df |>
+  count(tier_label) |>
+  mutate(tier_label = fct_reorder(tier_label, n)) |>
+  ggplot(aes(x = n, y = tier_label, fill = tier_label)) +
+  geom_col(width = 0.7, show.legend = FALSE) +
+  geom_text(aes(label = comma(n)), hjust = -0.15, size = 3.2, colour = epa_grey) +
+  scale_fill_manual(values = tier_colors) +
+  scale_x_continuous(labels = comma, expand = expansion(mult = c(0, 0.12))) +
+  labs(
+    title = "Plant Tier Assignment",
+    x     = "Number of plants",
+    y     = NULL
+  )
+```
+
+```{r tier-table}
+summary_df |>
+  count(tier_label) |>
+  mutate(
+    pct     = n / sum(n),
+    cum_n   = cumsum(n),
+    cum_pct = cumsum(pct)
+  ) |>
+  gt() |>
+  tab_header(title = "Tier Assignment Summary") |>
+  fmt_percent(columns = c(pct, cum_pct), decimals = 1) |>
+  fmt_integer(columns = c(n, cum_n)) |>
+  cols_label(
+    tier_label = "Tier",
+    n          = "N",
+    pct        = "%",
+    cum_n      = "Cumulative N",
+    cum_pct    = "Cumulative %"
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold", color = epa_blue),
+    locations = cells_column_labels()
+  ) |>
+  data_color(
+    columns = pct,
+    palette = c("white", epa_blue),
+    domain  = c(0, 1)
+  ) |>
+  opt_table_font(font = google_font("IBM Plex Sans"))
+```
+
+---
+
+# Stage 2 — Candidate Parcel Scoring
+
+## Score Distribution
+
+Stage 2 scores each candidate parcel with `stage2_prob_correct`. The threshold
+of **0.057** is intentionally low — it reflects the 1:50 hard-negative sampling
+ratio used during training.
+
+```{r stage2-hist}
+#| fig-cap: "Distribution of `stage2_prob_correct` across all 318,011 candidate
+#|   parcels. The low threshold is expected given the 1:50 hard-negative training regime."
+
+stage2 |>
+  ggplot(aes(x = stage2_prob_correct)) +
+  geom_histogram(bins = 100, fill = epa_blue, colour = "white", linewidth = 0.1) +
+  geom_vline(xintercept = STAGE2_THRESHOLD, colour = epa_red,
+             linetype = "dashed", linewidth = 0.9) +
+  annotate("text", x = STAGE2_THRESHOLD + 0.003, y = Inf,
+           label = glue("Threshold\n{STAGE2_THRESHOLD}"),
+           vjust = 1.3, hjust = 0, size = 3.2, colour = epa_red) +
+  scale_x_continuous(labels = percent_format(1)) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title    = "Stage 2 Candidate Parcel Score Distribution",
+    subtitle = glue("{comma(n_cands)} candidates across {comma(n_stage2)} flagged plants"),
+    x        = "stage2_prob_correct",
+    y        = "Number of candidate parcels",
+    caption  = "Low threshold expected due to 1:50 hard-negative sampling during training."
+  )
+```
+
+## Candidates per Plant
+
+```{r cands-per-plant}
+#| fig-cap: "Distribution of candidate parcel count per flagged plant. Candidates
+#|   are drawn from k=9 H3 rings (~5 km radius from reported location)."
+
+cands_per_plant <- stage2 |>
+  count(CWNS_ID, name = "n_candidates")
+
+p1 <- cands_per_plant |>
+  ggplot(aes(x = n_candidates)) +
+  geom_histogram(binwidth = 1, fill = epa_blue, colour = "white", linewidth = 0.1) +
+  coord_cartesian(xlim = c(0,50))+
+  scale_x_continuous(labels = comma) +
+  scale_y_continuous(labels = comma) +
+  labs(title = "Candidates per Plant", x = "Number of candidate parcels", y = "Number of plants")
+
+p2 <- cands_per_plant |>
+  ggplot(aes(y = n_candidates)) +
+  geom_boxplot(fill = epa_blue, alpha = 0.6, width = 0.4,
+               outlier.colour = epa_red, outlier.alpha = 0.3) +
+  scale_y_continuous(labels = comma) +
+  labs(y = "Candidates per plant", x = NULL) +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+
+p1 + p2 + plot_layout(widths = c(3, 1))
+```
+
+## Best Score per Plant (`top_stage2_prob`)
+
+The summary CSV carries the top-ranked candidate per plant as `top_stage2_prob`.
+This is the key decision variable for determining whether a plant receives a
+correction.
+
+```{r top-score}
+#| fig-cap: "Distribution of `top_stage2_prob` for flagged plants. Green = accepted
+#|   candidate (above threshold); grey = no strong candidate found."
+
+best_per_plant <- summary_df |>
+  filter(!is.na(top_stage2_prob)) |>
+  mutate(has_candidate = top_stage2_prob >= STAGE2_THRESHOLD)
+
+n_with_cand <- sum(best_per_plant$has_candidate)
+
+best_per_plant |>
+  ggplot(aes(x = top_stage2_prob, fill = has_candidate)) +
+  geom_histogram(bins = 80, colour = "white", linewidth = 0.1) +
+  geom_vline(xintercept = STAGE2_THRESHOLD, colour = epa_red,
+             linetype = "dashed", linewidth = 0.9) +
+  scale_fill_manual(
+    values = c("TRUE" = epa_green, "FALSE" = epa_grey),
+    labels = c("TRUE" = "Candidate accepted", "FALSE" = "No strong candidate")
+  ) +
+  scale_x_continuous(labels = percent_format(1)) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title    = "Best Stage 2 Score per Flagged Plant",
+    subtitle = glue(
+      "{comma(n_with_cand)} of {comma(n_stage2)} flagged plants ",
+      "({percent(n_with_cand / n_stage2, 0.1)}) have an accepted candidate"
+    ),
+    x    = "top_stage2_prob",
+    y    = "Number of plants",
+    fill = NULL
+  )
+```
+
+## Proximity of Accepted Candidates
+
+Stage 2 records `within_1km` and `within_5km` flags for each candidate, carried
+through to the summary for the top candidate.
+
+```{r proximity-breakdown}
+#| fig-cap: "Proximity breakdown of accepted Stage 2 candidates using `within_1km`
+#|   and `within_5km` flags."
+
+summary_df |>
+  filter(!is.na(top_stage2_prob), top_stage2_prob >= STAGE2_THRESHOLD) |>
+  mutate(proximity = case_when(
+    as.logical(within_1km)                          ~ "Within 1 km",
+    as.logical(within_5km) & !as.logical(within_1km) ~ "1 to 5 km",
+    !as.logical(within_5km)                         ~ "Beyond 5 km"
+  )) |>
+  count(proximity) |>
+  mutate(
+    proximity = factor(proximity, levels = c("Within 1 km", "1 to 5 km", "Beyond 5 km")),
+    pct       = n / sum(n)
+  ) |>
+  ggplot(aes(x = n, y = proximity, fill = proximity)) +
+  geom_col(width = 0.6, show.legend = FALSE) +
+  geom_text(aes(label = glue("{comma(n)} ({percent(pct, 0.1)})")),
+            hjust = -0.1, size = 3.2, colour = epa_grey) +
+  scale_fill_manual(values = c(epa_green, epa_gold, epa_red)) +
+  scale_x_continuous(labels = comma, expand = expansion(mult = c(0, 0.2))) +
+  labs(
+    title = "Proximity of Accepted Candidates to Reported Location",
+    x     = "Number of plants",
+    y     = NULL
+  )
+```
+
+---
+
+# Correction Distance Analysis
+
+`top_distance_m` records the distance in metres from the reported plant location
+to the top-ranked Stage 2 candidate parcel.
+
+## Overall Distance Distribution
+
+```{r distance-dist}
+#| fig-cap: "Distribution of `top_distance_m` for plants with an accepted correction.
+#|   Log scale used due to the long right tail."
+
+corrected <- summary_df |>
+  filter(!is.na(top_distance_m), top_stage2_prob >= STAGE2_THRESHOLD)
+
+med_dist  <- median(corrected$top_distance_m)
+mean_dist <- mean(corrected$top_distance_m)
+
+corrected |>
+  ggplot(aes(x = top_distance_m)) +
+  geom_histogram(bins = 80, fill = epa_blue, colour = "white", linewidth = 0.1) +
+  geom_vline(xintercept = med_dist,  colour = epa_green, linetype = "dashed", linewidth = 0.9) +
+  geom_vline(xintercept = mean_dist, colour = epa_gold,  linetype = "dashed", linewidth = 0.9) +
+  annotate("text", x = med_dist,  y = Inf,
+           label = glue("Median\n{comma(med_dist, 1)} m"),
+           vjust = 1.3, hjust = -0.1, size = 3, colour = epa_green) +
+  annotate("text", x = mean_dist, y = Inf,
+           label = glue("Mean\n{comma(mean_dist, 1)} m"),
+           vjust = 1.3, hjust = -0.1, size = 3, colour = epa_gold) +
+  scale_x_log10(labels = label_comma()) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title    = "Correction Distance Distribution",
+    subtitle = glue("{comma(nrow(corrected))} plants with accepted correction"),
+    x        = "top_distance_m (log scale)",
+    y        = "Number of plants"
+  )
+```
+
+## Distance by Tier
+
+```{r distance-by-tier}
+#| fig-cap: "Correction distance by tier. The T1 tier boundary at 5,000 m
+#|   is visible as the split between 'nearby' and 'distant' tiers."
+
+summary_df |>
+  filter(!is.na(top_distance_m), top_stage2_prob >= STAGE2_THRESHOLD) |>
+  ggplot(aes(x = top_distance_m, y = tier_label, fill = tier_label)) +
+  geom_density_ridges(alpha = 0.75, quantile_lines = TRUE,
+                      quantiles = 0.5, colour = "white", scale = 0.9) +
+  scale_fill_manual(values = tier_colors, guide = "none") +
+  scale_x_log10(labels = label_comma()) +
+  labs(
+    title = "Correction Distance by Tier",
+    x     = "top_distance_m (log scale)",
+    y     = NULL
+  )
+```
+
+## Cumulative Correction Distance
+
+```{r ecdf-distance}
+#| fig-cap: "ECDF of correction distances. Dotted lines mark common thresholds."
+
+distance_cuts <- c(100, 250, 500, 1000, 5000)
+
+corrected |>
+  ggplot(aes(x = top_distance_m)) +
+  stat_ecdf(colour = epa_blue, linewidth = 1.1) +
+  geom_vline(xintercept = distance_cuts, colour = epa_grey,
+             linetype = "dotted", linewidth = 0.5) +
+  annotate("text",
+           x     = distance_cuts, y = 0.02,
+           label = paste0(distance_cuts / 1000, " km"),
+           size  = 2.8, colour = epa_grey, hjust = -0.1) +
+  scale_x_log10(labels = label_comma()) +
+  scale_y_continuous(labels = percent_format(), breaks = seq(0, 1, 0.1)) +
+  labs(
+    title = "Cumulative Distribution of Correction Distances",
+    x     = "top_distance_m (log scale)",
+    y     = "Cumulative proportion of corrected plants"
+  )
+```
+
+```{r distance-summary-table}
+corrected |>
+  summarise(
+    N              = n(),
+    `Min (m)`      = min(top_distance_m),
+    `P10 (m)`      = quantile(top_distance_m, 0.10),
+    `Median (m)`   = median(top_distance_m),
+    `Mean (m)`     = mean(top_distance_m),
+    `P90 (m)`      = quantile(top_distance_m, 0.90),
+    `Max (m)`      = max(top_distance_m),
+    `% < 500 m`    = mean(top_distance_m < 500),
+    `% 500 m-5 km` = mean(top_distance_m >= 500 & top_distance_m < 5000),
+    `% >= 5 km`    = mean(top_distance_m >= 5000)
+  ) |>
+  pivot_longer(everything(), names_to = "Statistic", values_to = "Value") |>
+  mutate(
+    formatted = case_when(
+      str_detect(Statistic, "^%") ~ percent(Value, 0.1),
+      Statistic == "N"            ~ comma(Value, 1),
+      TRUE                        ~ comma(Value, 1)
+    )
+  ) |>
+  select(Statistic, Value = formatted) |>
+  gt() |>
+  tab_header(title = "Correction Distance Summary Statistics") |>
+  tab_style(
+    style = cell_text(weight = "bold", color = epa_blue),
+    locations = cells_column_labels()
+  ) |>
+  opt_row_striping() |>
+  opt_table_font(font = google_font("IBM Plex Sans"))
+```
+
+---
+
+# High-Confidence Corrections — Spot-Check
+
+Top 25 nearby corrections (Tier 1 nearby or Tier 2 corrected) ranked by
+`top_stage2_prob`. The `top_ll_uuid` column identifies the accepted parcel in
+the Regrid dataset.
+
+```{r spot-check}
+summary_df |>
+  filter(tier %in% c("Tier1_nearby_correction", "Tier2_no_parcel_corrected")) |>
+  arrange(desc(top_stage2_prob)) |>
+  slice_head(n = 25) |>
+  select(
+    CWNS_ID,
+    FACILITY_NAME,
+    STATE_CODE,
+    tier_label,
+    stage1_prob_correct,
+    top_stage2_prob,
+    top_distance_m,
+    top_ll_uuid
+  ) |>
+  gt() |>
+  tab_header(
+    title    = "Top 25 High-Confidence Corrections",
+    subtitle = "Ranked by top_stage2_prob — nearby corrections only"
+  ) |>
+  fmt_number(columns = c(stage1_prob_correct, top_stage2_prob), decimals = 3) |>
+  fmt_number(columns = top_distance_m, decimals = 0) |>
+  cols_label(
+    CWNS_ID             = "CWNS ID",
+    FACILITY_NAME       = "Facility",
+    STATE_CODE          = "State",
+    tier_label          = "Tier",
+    stage1_prob_correct = "Stage 1",
+    top_stage2_prob     = "Stage 2",
+    top_distance_m      = "Distance (m)",
+    top_ll_uuid         = "Parcel UUID"
+  ) |>
+  data_color(
+    columns = top_stage2_prob,
+    palette = c("white", epa_green),
+    domain  = c(0, 1)
+  ) |>
+  data_color(
+    columns = stage1_prob_correct,
+    palette = c(epa_red, "white"),
+    domain  = c(0, 1)
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold", color = epa_blue),
+    locations = cells_column_labels()
+  ) |>
+  opt_table_font(font = google_font("IBM Plex Sans")) |>
+  tab_options(table.font.size = "small")
+```
+
+---
+
+# Distant Corrections — Manual Review Candidates
+
+Tier 1 distant corrections (beyond 5 km per `within_5km = FALSE`) require manual
+QA before applying. Ranked by `top_stage2_prob` to prioritise the most confident
+predictions.
+
+```{r distant-table}
+summary_df |>
+  filter(tier == "Tier1_distant_correction") |>
+  arrange(desc(top_stage2_prob)) |>
+  select(
+    CWNS_ID,
+    FACILITY_NAME,
+    STATE_CODE,
+    stage1_prob_correct,
+    top_stage2_prob,
+    top_distance_m,
+    top_ll_uuid
+  ) |>
+  slice_head(n = 30) |>
+  gt() |>
+  tab_header(
+    title    = "Distant Corrections (beyond 5 km)",
+    subtitle = "Top 30 by top_stage2_prob — prioritise these for manual GIS review"
+  ) |>
+  fmt_number(columns = c(stage1_prob_correct, top_stage2_prob), decimals = 3) |>
+  fmt_number(columns = top_distance_m, decimals = 0) |>
+  cols_label(
+    CWNS_ID             = "CWNS ID",
+    FACILITY_NAME       = "Facility",
+    STATE_CODE          = "State",
+    stage1_prob_correct = "Stage 1",
+    top_stage2_prob     = "Stage 2",
+    top_distance_m      = "Distance (m)",
+    top_ll_uuid         = "Parcel UUID"
+  ) |>
+  data_color(
+    columns = top_distance_m,
+    palette = c("white", epa_red),
+    domain  = NULL
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold", color = epa_blue),
+    locations = cells_column_labels()
+  ) |>
+  opt_table_font(font = google_font("IBM Plex Sans")) |>
+  tab_options(table.font.size = "small")
+```
+
+---
+
+# Geographic Distribution
+
+## State-Level Summary
+
+```{r state-summary}
+#| fig-height: 7
+#| fig-cap: "Proportion of plants flagged by Stage 1 by state (`STATE_CODE`). High
+#|   flag rates may reflect parcel coverage gaps or systematic geocoding errors in CWNS."
+
+state_summary <- summary_df |>
+  group_by(STATE_CODE) |>
+  summarise(
+    n_plants      = n(),
+    n_flagged     = sum(tier != "Tier3_likely_correct"),
+    pct_flagged   = n_flagged / n_plants,
+    n_corrected   = sum(tier %in% tier_raw_corrected),
+    pct_corrected = n_corrected / n_plants,
+    .groups = "drop"
+  ) |>
+  arrange(desc(pct_flagged))
+
+state_summary |>
+  slice_head(n = 30) |>
+  mutate(STATE_CODE = fct_reorder(STATE_CODE, pct_flagged)) |>
+  ggplot(aes(x = pct_flagged, y = STATE_CODE)) +
+  geom_col(fill = epa_blue, width = 0.7) +
+  geom_col(aes(x = pct_corrected), fill = epa_green, width = 0.7, alpha = 0.85) +
+  scale_x_continuous(labels = percent_format(), expand = expansion(mult = c(0, 0.05))) +
+  labs(
+    title    = "Top 30 States by Flag Rate",
+    subtitle = "Blue = flagged · Green overlay = successfully corrected",
+    x        = "Proportion of plants",
+    y        = "State"
+  )
+```
+
+## Tier Composition by State
+
+```{r tier-by-state}
+#| fig-height: 8
+#| fig-cap: "Tier composition (proportion) for the 20 most-flagged states."
+
+top20_states <- state_summary |>
+  slice_max(n_flagged, n = 20) |>
+  pull(STATE_CODE)
+
+summary_df |>
+  filter(STATE_CODE %in% top20_states) |>
+  count(STATE_CODE, tier_label) |>
+  group_by(STATE_CODE) |>
+  mutate(prop = n / sum(n)) |>
+  ungroup() |>
+  mutate(STATE_CODE = factor(STATE_CODE, levels = rev(top20_states))) |>
+  ggplot(aes(x = prop, y = STATE_CODE, fill = tier_label)) +
+  geom_col(width = 0.75) +
+  scale_fill_manual(values = tier_colors) +
+  scale_x_continuous(labels = percent_format()) +
+  labs(
+    title = "Tier Composition — Top 20 States by Flagged Plants",
+    x     = "Proportion of plants",
+    y     = NULL,
+    fill  = NULL
+  ) +
+  theme(legend.position = "right")
+```
+
+## Rural vs. Urban Flag Rates
+
+```{r rural-urban}
+#| fig-cap: "Stage 1 score distributions by `is_rural`. Rural plants may have
+#|   sparser parcel data, affecting both flag rates and correction availability."
+
+summary_df |>
+  mutate(setting = if_else(is_rural, "Rural", "Urban/suburban")) |>
+  ggplot(aes(x = stage1_prob_correct, y = setting, fill = setting)) +
+  geom_density_ridges(alpha = 0.75, quantile_lines = TRUE,
+                      quantiles = 0.5, colour = "white") +
+  geom_vline(xintercept = STAGE1_THRESHOLD, colour = epa_red,
+             linetype = "dashed", linewidth = 0.8) +
+  scale_fill_manual(values = c("Rural" = epa_gold, "Urban/suburban" = epa_blue),
+                    guide = "none") +
+  scale_x_continuous(labels = percent_format(1), limits = c(0, 1)) +
+  labs(
+    title = "Stage 1 Scores by Rural/Urban Setting",
+    x     = "stage1_prob_correct",
+    y     = NULL
+  )
+```
+
+## Population Served vs. Confidence Score
+
+```{r pop-vs-score}
+#| fig-cap: "Relationship between `pop_served` and `stage1_prob_correct`.
+#|   Larger plants may have more reliable reported coordinates."
+
+summary_df |>
+  filter(!is.na(pop_served), pop_served > 0) |>
+  ggplot(aes(x = pop_served, y = stage1_prob_correct,
+             colour = tier == "Tier3_likely_correct")) +
+  geom_point(alpha = 0.25, size = 0.8) +
+  geom_hline(yintercept = STAGE1_THRESHOLD, colour = epa_red,
+             linetype = "dashed", linewidth = 0.7) +
+  scale_x_log10(labels = label_comma()) +
+  scale_colour_manual(
+    values = c("TRUE" = epa_green, "FALSE" = epa_red),
+    labels = c("TRUE" = "Likely correct", "FALSE" = "Flagged"),
+    name   = NULL
+  ) +
+  labs(
+    title = "Population Served vs. Stage 1 Confidence",
+    x     = "Population served (log scale)",
+    y     = "stage1_prob_correct"
+  )
+```
+
+---
+
+# Geopackage Layer Review
+
+The `inference_results.gpkg` file contains three spatial layers for visual
+inspection in QGIS or R. The `eval` condition below skips this section if the
+file is not present.
+
+```{r gpkg-layers}
+#| eval: !expr file.exists(path_gpkg)
+
+layers <- st_layers(path_gpkg)$name
+cat("Layers found in geopackage:\n")
+print(layers)
+```
+
+```{r gpkg-preview}
+#| eval: !expr file.exists(path_gpkg)
+#| fig-cap: "Sample of up to 500 corrected plants: reported (red), accepted
+#|   candidate (green), and correction vectors (grey lines)."
+
+# Adjust layer indices below if the layer order differs
+reported   <- st_read(path_gpkg, layer = layers[1], quiet = TRUE)
+candidates <- st_read(path_gpkg, layer = layers[2], quiet = TRUE)
+lines      <- st_read(path_gpkg, layer = layers[3], quiet = TRUE)
+
+corrected_ids <- summary_df |>
+  filter(tier %in% tier_raw_corrected) |>
+  pull(CWNS_ID)
+
+set.seed(42)
+sample_ids <- sample(corrected_ids, min(500, length(corrected_ids)))
+
+# Assumes CWNS_ID is the join key in the geopackage layers; adjust if needed
+rep_samp  <- reported   |> filter(CWNS_ID %in% sample_ids)
+cand_samp <- candidates |> filter(CWNS_ID %in% sample_ids)
+line_samp <- lines      |> filter(CWNS_ID %in% sample_ids)
+
+ggplot() +
+  geom_sf(data = line_samp,  colour = epa_grey,  linewidth = 0.3, alpha = 0.5) +
+  geom_sf(data = cand_samp,  colour = epa_green, size = 1.2, shape = 16, alpha = 0.7) +
+  geom_sf(data = rep_samp,   colour = epa_red,   size = 1.2, shape = 16, alpha = 0.7) +
+  labs(
+    title    = "Reported (red) to Corrected (green) Location Sample",
+    subtitle = glue("Random sample of {length(sample_ids)} corrected plants"),
+    caption  = "Lines connect reported to accepted candidate location."
+  ) +
+  theme(axis.text = element_text(size = 7))
+```
+
+---
+
+# Summary & Recommendations
+
+```{r tier-counts}
+#| echo: false
+n_t1_near <- sum(summary_df$tier == "Tier1_nearby_correction")
+n_t1_dist <- sum(summary_df$tier == "Tier1_distant_correction")
+n_t1_none <- sum(summary_df$tier == "Tier1_no_candidate")
+n_t2_corr <- sum(summary_df$tier == "Tier2_no_parcel_corrected")
+n_t2_none <- sum(summary_df$tier == "Tier2_no_parcel_uncorrected")
+n_t3      <- sum(summary_df$tier == "Tier3_likely_correct")
+```
+
+## Actionable Tier Summary
+
+| Priority | Tier | N | Recommended Action |
+|----------|------|---|--------------------|
+| Done | T3 — Likely correct | `r comma(n_t3)` | Accept reported location; no action needed |
+| Auto-apply | T1 — Nearby correction | `r comma(n_t1_near)` | Apply `top_ll_uuid` candidate; spot-check the high-distance tail |
+| Auto-apply | T2 — No parcel, corrected | `r comma(n_t2_corr)` | Apply `top_ll_uuid` candidate; confirm parcel is plausible |
+| Manual QA | T1 — Distant correction | `r comma(n_t1_dist)` | Sort by `top_stage2_prob` desc; verify each in QGIS before applying |
+| Manual QA | T1 — No candidate | `r comma(n_t1_none)` | Cross-reference CWNS address fields; consider geocoding fallback |
+| Flag only | T2 — No parcel, uncorrected | `r comma(n_t2_none)` | Flag as unresolved; likely reflects Regrid coverage gaps |
+
+## Next Steps
+
+1. **Apply automatic corrections** for T1-nearby and T2-corrected tiers. Export a
+   correction table keyed by `CWNS_ID` with columns `top_ll_uuid`,
+   `top_distance_m`, and `tier`.
+
+2. **Manual QA queue** — export T1-distant plants sorted descending by
+   `top_stage2_prob`. Step through correction lines in `inference_results.gpkg`
+   using QGIS to visually assess each candidate before accepting.
+
+3. **T1-no-candidate investigation** — cross-reference `CWNS_ID` against CWNS
+   address fields. A Stage 3 address-geocoding pass (Census Bureau geocoder or
+   TIGER/Line) could recover some of these cases.
+
+4. **T2-uncorrected coverage audit** — check whether `Tier2_no_parcel_uncorrected`
+   plants cluster by `STATE_CODE`. Regrid parcel coverage is uneven across states
+   and may explain the pattern.
+
+5. **Model retraining** — verified corrections from this run can be added to the
+   Stage 2 training set (currently 203 positives). Target 400-500 verified
+   positives before the next iteration to meaningfully improve recall on distant
+   corrections.
+
+---
+
+# Session Info
+
+```{r session-info}
+sessioninfo::session_info()
+```
+
+```{r rename-output}
+#| echo: false
+#| message: false
+# ── Rename output file to reflect the model version ───────────────────────────
+# Quarto does not support !expr in output-file, so we rename post-render.
+# This chunk runs last and renames the default .html output to
+#   cwns_location_correction_report_Version_N.html
+# in the same directory as the .qmd file.
+
+.qmd_dir     <- here::here()
+.default_out <- file.path(.qmd_dir, "cwns_location_correction_report.html")
+.target_out  <- file.path(.qmd_dir,
+                           paste0("cwns_location_correction_report_",
+                                  version_label, ".html"))
+
+if (file.exists(.default_out) && .default_out != .target_out) {
+  file.rename(.default_out, .target_out)
+  message("Output renamed to: ", basename(.target_out))
+} else if (file.exists(.target_out)) {
+  message("Output already at: ", basename(.target_out))
+} else {
+  message("Note: default output not found for renaming (",
+          basename(.default_out), ") — file may have been named differently.")
+}
+```
