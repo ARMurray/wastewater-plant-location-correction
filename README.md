@@ -25,10 +25,13 @@ It does so with two independent signals that cross-check each other:
    nearby land parcels (gathered from **H3** hexagon rings) as candidate
    corrections.
 
-![YOLOv8 predictions on held-out NAIP validation tiles](object_detection/results/val_batch0_pred.jpg)
+![Annotated NAIP training tiles showing labeled treatment-plant infrastructure](object_detection/results/training_examples.jpg)
 
-*YOLOv8 detections on held-out NAIP validation tiles — each box is a piece of
-detected treatment-plant infrastructure.*
+*What the detector is trained to recognize: NAIP aerial tiles with ground-truth
+annotations of treatment-plant infrastructure — circular **clarifiers** and
+**digesters**, rectangular **aeration basins**, and **oxidation ponds** (pink).
+The model is in active iteration; these are labeled training examples, not
+predictions.*
 
 ## Results
 
@@ -67,7 +70,7 @@ object_detection/     PyTorch/YOLOv8 module — dataset prep, training, inferenc
   train_model.py        YOLOv8s transfer learning with aerial-tuned augmentation
   infer.py              run the model; convert detections to geographic coordinates
   weights/best.pt       trained round-1 model
-  results/              validation predictions, PR curve, confusion matrix
+  results/              labeled training examples, PR curve, confusion matrix
   OVERVIEW.md           detailed methodology
   tests/                dependency-light smoke tests (run in CI)
 location_model/       Two-stage tabular pipeline + H3 candidate scoring (R)
